@@ -6,11 +6,21 @@ Tracks two sampling slots per day:
     0900 = morning slot
     2100 = evening slot
 
+Flight matching is based EXACTLY on:
+
+    flight_number
+    departure date
+    departure airport
+    arrival airport
+    number of stops
+    duration
+
 Each API search returns many flights. The collector stores:
 
 1. Flight level:
    - RANDOM_FLIGHTS_PER_NEW_ROUTE randomly selected flights are watched.
-   - Those specific flights are re-quoted on later samples.
+   - Those specific flight identities are re-quoted on later samples.
+   - Matching uses the exact composite flight key above.
 
 2. Route level:
    - Cheapest and 2nd-cheapest qualifying offers are stored every sample.
@@ -42,14 +52,29 @@ Usage:
     # Status
     python3 collect_fares.py status
 
-Manual slot behavior:
+The flight_quotes table contains:
 
-If you miss the 09:00 slot, you can run this at 23:00:
+    entry_type = FIRST_ENTRY
+        The flight identity was first inserted into flight_watches.
 
-    python3 collect_fares.py once --slot 0900
+    entry_type = MATCHED_ENTRY
+        The exact same flight key was already being watched and was
+        matched again on a later search.
 
-The actual sampled_at timestamp will still show 23:00, but the database
-slot column will be "0900". This allows missed slots to be backfilled.
+Flight key:
+
+    flight_number
+    departure date
+    departure airport
+    arrival airport
+    stops
+    duration
+
+Example:
+
+    6E123|2026-11-15|DEL|BOM|0|02:10
+
+If ANY of these fields changes, it is treated as a different flight identity.
 
 Source:
     FareEagle public search API.
@@ -125,14 +150,14 @@ DAYS_AHEAD_MIN = 1
 DAYS_AHEAD_MAX = 60
 
 # Number of route/date watches maintained.
-MAX_ROUTE_DATE_WATCHES = 20
+MAX_ROUTE_DATE_WATCHES = 45
 
 # Number of random flights selected from each NEW route/date search.
 #
 # IMPORTANT:
 # This does NOT mean 5 additional API searches.
 # One API search returns many flights, from which we randomly select 5.
-RANDOM_FLIGHTS_PER_NEW_ROUTE = 5
+RANDOM_FLIGHTS_PER_NEW_ROUTE = 10
 
 # One API search returns many flights.
 # Therefore API usage scales with route-dates, not individual flights.
@@ -168,6 +193,7 @@ AIRPORTS: dict[str, str] = {
     "BOM": "Mumbai",
     "GOI": "Goa Dabolim",
     "GOX": "Goa Mopa",
+    "NMI": "Navi Mumbai",
 }
 
 
@@ -222,8 +248,7 @@ def validate_slot(slot: str) -> str:
 
     if slot not in allowed:
         raise ValueError(
-            f"Invalid slot '{slot}'. "
-            f"Use 0900 or 2100."
+            f"Invalid slot '{slot}'. Use 0900 or 2100."
         )
 
     return allowed[slot]
@@ -337,13 +362,16 @@ def days_to_dep(
     dep_date: str,
     ts: datetime,
 ) -> int:
+
     d = date.fromisoformat(dep_date)
+
     return (d - ts.date()).days
 
 
 def airline_type(
     code: str | None,
 ) -> str:
+
     if not code:
         return "unknown"
 
@@ -354,6 +382,7 @@ def airline_type(
 
 
 def directed_routes() -> list[tuple[str, str]]:
+
     codes = list(AIRPORTS)
 
     return [
@@ -371,6 +400,7 @@ def directed_routes() -> list[tuple[str, str]]:
 def parse_price(
     offer: dict[str, Any],
 ) -> float | None:
+
     price = offer.get("price")
 
     if isinstance(price, dict):
@@ -390,6 +420,7 @@ def parse_seats(
 ) -> int | None:
 
     for key in SEAT_KEYS:
+
         val = offer.get(key)
 
         if val is None:
@@ -402,6 +433,7 @@ def parse_seats(
             return int(val)
 
         if isinstance(val, str):
+
             digits = "".join(
                 ch
                 for ch in val
@@ -439,6 +471,7 @@ def loc_field(
         return ""
 
     for key in keys:
+
         val = block.get(key)
 
         if val:
@@ -447,50 +480,119 @@ def loc_field(
     return ""
 
 
+# ---------------------------------------------------------------------------
+# IMPORTANT:
+# Exact flight matching key
+# ---------------------------------------------------------------------------
+
+def normalize_duration(
+    offer: dict[str, Any],
+) -> str:
+    """Return a stable duration string for flight matching.
+
+    Preference:
+
+        1. duration_minutes
+        2. duration
+
+    Examples:
+
+        duration_minutes = 130
+            -> "130"
+
+        duration = "02:10"
+            -> "02:10"
+
+    The value is deliberately included in flight_key.
+    """
+
+    duration_minutes = offer.get(
+        "duration_minutes"
+    )
+
+    if duration_minutes is not None:
+
+        try:
+            return str(
+                int(float(duration_minutes))
+            )
+
+        except (
+            ValueError,
+            TypeError,
+        ):
+            pass
+
+    duration = offer.get("duration")
+
+    if duration is None:
+        return ""
+
+    return str(duration).strip()
+
+
 def flight_key(
     offer: dict[str, Any],
 ) -> str:
+    """Build the exact identity used for flight matching.
+
+    MATCHING PARAMETERS:
+
+        flight number
+        departure date
+        departure airport
+        arrival airport
+        number of stops
+        duration
+
+    Example:
+
+        6E123|2026-11-15|DEL|BOM|0|130
+
+    Any change in one of these values produces a different key.
+    """
 
     dep = offer.get("departure") or {}
     arr = offer.get("arrival") or {}
 
+    flight_number = str(
+        offer.get("flight_number")
+        or ""
+    ).strip().upper()
+
+    dep_date = loc_field(
+        dep,
+        "date",
+    )
+
+    dep_airport = loc_field(
+        dep,
+        "airport",
+    ).strip().upper()
+
+    arr_airport = loc_field(
+        arr,
+        "airport",
+    ).strip().upper()
+
+    stops = str(
+        int(
+            offer.get("stops") or 0
+        )
+    )
+
+    duration = normalize_duration(
+        offer
+    )
+
     return "|".join(
         [
-            str(
-                offer.get("flight_number")
-                or ""
-            ),
-
-            loc_field(
-                dep,
-                "date",
-            ),
-
-            loc_field(
-                dep,
-                "time",
-            )[:5],
-
-            loc_field(
-                arr,
-                "time",
-            )[:5],
-
-            loc_field(
-                dep,
-                "airport",
-            ),
-
-            loc_field(
-                arr,
-                "airport",
-            ),
-
-            str(
-                offer.get("stops")
-                if offer.get("stops") is not None
-                else ""
-            ),
+            flight_number,
+            dep_date,
+            dep_airport,
+            arr_airport,
+            stops,
+            duration,
         ]
     )
 
@@ -508,6 +610,7 @@ def _decode_token_payload(
         return None
 
     try:
+
         if isinstance(token, dict):
             return token
 
@@ -515,6 +618,7 @@ def _decode_token_payload(
 
         # Plain JSON.
         if raw.startswith("{"):
+
             obj = json.loads(raw)
 
             return (
@@ -533,12 +637,14 @@ def _decode_token_payload(
         )
 
         for candidate in candidates:
+
             padded = (
                 candidate
                 + "=" * (-len(candidate) % 4)
             )
 
             try:
+
                 decoded = (
                     base64.urlsafe_b64decode(
                         padded
@@ -575,16 +681,18 @@ def extract_token_metadata(
     searched_at = None
     supplier_tag = None
 
-    # Direct fields.
     for key in (
         "searched_at",
         "search_time",
         "search_timestamp",
     ):
+
         if offer.get(key):
+
             searched_at = str(
                 offer[key]
             )
+
             break
 
     for key in (
@@ -594,13 +702,15 @@ def extract_token_metadata(
         "provider",
         "provider_code",
     ):
+
         if offer.get(key):
+
             supplier_tag = str(
                 offer[key]
             )
+
             break
 
-    # Token payload.
     if payload:
 
         for key in (
@@ -608,10 +718,13 @@ def extract_token_metadata(
             "search_time",
             "search_timestamp",
         ):
+
             if payload.get(key):
+
                 searched_at = str(
                     payload[key]
                 )
+
                 break
 
         for key in (
@@ -621,13 +734,15 @@ def extract_token_metadata(
             "provider",
             "provider_code",
         ):
+
             if payload.get(key):
+
                 supplier_tag = str(
                     payload[key]
                 )
+
                 break
 
-        # Nested metadata.
         for container_key in (
             "search",
             "metadata",
@@ -646,18 +761,23 @@ def extract_token_metadata(
                 continue
 
             if searched_at is None:
+
                 for key in (
                     "searched_at",
                     "search_time",
                     "search_timestamp",
                 ):
+
                     if nested.get(key):
+
                         searched_at = str(
                             nested[key]
                         )
+
                         break
 
             if supplier_tag is None:
+
                 for key in (
                     "supplier_tag",
                     "supplier",
@@ -665,10 +785,13 @@ def extract_token_metadata(
                     "provider",
                     "provider_code",
                 ):
+
                     if nested.get(key):
+
                         supplier_tag = str(
                             nested[key]
                         )
+
                         break
 
     return {
@@ -724,14 +847,18 @@ def normalize_offer(
     ).upper()[:3]
 
     if not code:
+
         number = str(
             offer.get("flight_number")
             or ""
         ).upper()
 
         for prefix in ALLOWED_AIRLINE_CODES:
+
             if number.startswith(prefix):
+
                 code = prefix
+
                 break
 
     if code not in ALLOWED_AIRLINE_CODES:
@@ -771,55 +898,77 @@ def normalize_offer(
         offer
     )
 
-    return {
+    normalized = {
         "origin": origin,
         "dest": dest,
         "dep_date": dep_date,
-        "flight_key": flight_key(offer),
+
+        # EXACT MATCHING KEY
+        "flight_key": flight_key(
+            offer
+        ),
+
         "flight_number": str(
             offer.get("flight_number")
             or ""
         ),
+
         "airline": str(
             offer.get("airline")
             or ""
         ),
+
         "airline_code": code,
-        "airline_type": airline_type(code),
+
+        "airline_type": airline_type(
+            code
+        ),
+
         "dep_airport": loc_field(
             dep,
             "airport",
         ),
+
         "arr_airport": loc_field(
             arr,
             "airport",
         ),
+
         "dep_city": loc_field(
             dep,
             "city",
         ),
+
         "arr_city": loc_field(
             arr,
             "city",
         ),
+
         "dep_time": loc_field(
             dep,
             "time",
         )[:5],
+
         "arr_time": loc_field(
             arr,
             "time",
         )[:5],
+
         "stops": stops,
+
         "duration": str(
             offer.get("duration")
             or ""
         ),
+
         "duration_minutes": offer.get(
             "duration_minutes"
         ),
+
         "cabin_class": cabin,
+
         "price_inr": price,
+
         "currency": (
             (
                 offer.get("price")
@@ -834,6 +983,7 @@ def normalize_offer(
             )
             else "INR"
         ),
+
         "is_refundable": (
             1
             if offer.get(
@@ -841,29 +991,37 @@ def normalize_offer(
             )
             else 0
         ),
+
         "baggage_checkin": str(
             baggage.get("checkin")
             or ""
         ),
+
         "baggage_cabin": str(
             baggage.get("cabin")
             or ""
         ),
+
         "baggage_checkin_kg": parse_kg(
             baggage.get("checkin")
         ),
+
         "baggage_cabin_kg": parse_kg(
             baggage.get("cabin")
         ),
+
         "seats_remaining": parse_seats(
             offer
         ),
+
         "searched_at": token_meta[
             "searched_at"
         ],
+
         "supplier_tag": token_meta[
             "supplier_tag"
         ],
+
         "extra_json": (
             json.dumps(
                 extra,
@@ -873,6 +1031,8 @@ def normalize_offer(
             else ""
         ),
     }
+
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +1092,10 @@ def connect() -> sqlite3.Connection:
             flight_key TEXT NOT NULL,
             sampled_at TEXT NOT NULL,
             slot TEXT NOT NULL,
+
+            -- FIRST_ENTRY or MATCHED_ENTRY
+            entry_type TEXT NOT NULL DEFAULT 'MATCHED_ENTRY',
+
             origin TEXT,
             dest TEXT,
             dep_date TEXT,
@@ -997,12 +1161,17 @@ def connect() -> sqlite3.Connection:
             ON flight_quotes(flight_key, sampled_at);
 
         CREATE INDEX IF NOT EXISTS idx_route_best_od_time
-            ON route_best_quotes(origin, dest, dep_date, sampled_at);
+            ON route_best_quotes(
+                origin,
+                dest,
+                dep_date,
+                sampled_at
+            );
         """
     )
 
     # -----------------------------------------------------------------------
-    # Safe migration of existing database.
+    # Safe migrations for existing databases.
     # -----------------------------------------------------------------------
 
     migrations = (
@@ -1020,6 +1189,11 @@ def connect() -> sqlite3.Connection:
             "flight_quotes",
             "supplier_changed",
             "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "flight_quotes",
+            "entry_type",
+            "TEXT NOT NULL DEFAULT 'MATCHED_ENTRY'",
         ),
         (
             "route_best_quotes",
@@ -1057,6 +1231,7 @@ def connect() -> sqlite3.Connection:
         }
 
         if column not in existing:
+
             conn.execute(
                 f"""
                 ALTER TABLE {table}
@@ -1136,6 +1311,82 @@ def active_route_dates(
     ]
 
 
+def active_route_count(
+    conn: sqlite3.Connection,
+) -> int:
+
+    return conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM route_watches
+        WHERE active=1
+        """
+    ).fetchone()[0]
+
+
+def enforce_watch_cap(
+    conn: sqlite3.Connection,
+) -> None:
+    """Guarantee at most MAX_ROUTE_DATE_WATCHES active, distinct watches.
+
+    Distinctness is enforced by UNIQUE(origin, dest, dep_date) in the
+    schema. This additionally trims any excess (e.g. caused by two
+    overlapping runs) by deactivating the most recently created ones.
+    """
+
+    excess = (
+        active_route_count(conn)
+        - MAX_ROUTE_DATE_WATCHES
+    )
+
+    if excess <= 0:
+        return
+
+    rows = conn.execute(
+        """
+        SELECT id, origin, dest, dep_date
+        FROM route_watches
+        WHERE active=1
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        """,
+        (excess,),
+    ).fetchall()
+
+    for r in rows:
+
+        conn.execute(
+            """
+            UPDATE route_watches
+            SET active=0
+            WHERE id=?
+            """,
+            (r["id"],),
+        )
+
+        conn.execute(
+            """
+            UPDATE flight_watches
+            SET active=0
+            WHERE origin=?
+              AND dest=?
+              AND dep_date=?
+            """,
+            (
+                r["origin"],
+                r["dest"],
+                r["dep_date"],
+            ),
+        )
+
+    conn.commit()
+
+    print(
+        f"Trimmed {len(rows)} excess route watch(es) "
+        f"to keep {MAX_ROUTE_DATE_WATCHES} unique watches."
+    )
+
+
 def watched_keys_for(
     conn: sqlite3.Connection,
     origin: str,
@@ -1202,7 +1453,17 @@ def upsert_flight_watch(
     ts: str,
 ) -> None:
 
-    # First observed supplier becomes baseline.
+    # IMPORTANT:
+    # Do NOT change the original supplier baseline here.
+    #
+    # The UNIQUE constraint on flight_key means that this exact
+    # combination:
+    #
+    # flight_number + dep_date + dep_airport + arr_airport
+    # + stops + duration
+    #
+    # represents one watched flight identity.
+
     conn.execute(
         """
         INSERT INTO flight_watches(
@@ -1252,13 +1513,19 @@ def upsert_flight_watch(
 # API
 # ---------------------------------------------------------------------------
 
-def search_flights(origin: str, dest: str, dep_date: str) -> list[dict[str, Any]]:
+def search_flights(
+    origin: str,
+    dest: str,
+    dep_date: str,
+) -> list[dict[str, Any]]:
+
     params = {
         "from": origin,
         "to": dest,
         "date": dep_date,
         "adults": ADULTS,
         "class": CABIN,
+        "limit": 100,
     }
 
     resp = requests.get(
@@ -1267,13 +1534,24 @@ def search_flights(origin: str, dest: str, dep_date: str) -> list[dict[str, Any]
         timeout=HTTP_TIMEOUT,
         headers={
             "Accept": "application/json",
-            "User-Agent": "FlightPrediction/0.1 (research)",
+            "User-Agent": (
+                "FlightPrediction/0.1 (research)"
+            ),
         },
     )
 
     if resp.status_code == 429:
-        retry = int(resp.headers.get("Retry-After") or 60)
-        raise RuntimeError(f"rate limited; retry after {retry}s")
+
+        retry = int(
+            resp.headers.get(
+                "Retry-After"
+            )
+            or 60
+        )
+
+        raise RuntimeError(
+            f"rate limited; retry after {retry}s"
+        )
 
     resp.raise_for_status()
 
@@ -1281,66 +1559,148 @@ def search_flights(origin: str, dest: str, dep_date: str) -> list[dict[str, Any]
 
     data = payload.get("data") or {}
 
-    print("RAW DATA KEYS:", data.keys())
-    print("RAW TOTAL RESULTS:", data.get("total_results"))
-    print("RAW SEARCH PAGE:", data.get("search_page"))
-    print("RAW FLIGHTS COUNT:", len(data.get("flights") or []))
+    print(
+        "RAW DATA KEYS:",
+        data.keys(),
+    )
+
+    print(
+        "RAW TOTAL RESULTS:",
+        data.get("total_results"),
+    )
+
+    print(
+        "RAW SEARCH PAGE:",
+        data.get("search_page"),
+    )
+
+    print(
+        "RAW FLIGHTS COUNT:",
+        len(
+            data.get("flights") or []
+        ),
+    )
 
     if not payload.get("success"):
-        raise RuntimeError(f"search failed: {payload}")
 
-    flights = (payload.get("data") or {}).get("flights") or []
+        raise RuntimeError(
+            f"search failed: {payload}"
+        )
 
-    print(f"\n  RAW API OFFERS: {len(flights)}")
+    flights = (
+        payload.get("data") or {}
+    ).get("flights") or []
+
+    print(
+        f"\n  RAW API OFFERS: "
+        f"{len(flights)}"
+    )
 
     offers = []
+
     rejected_airline = 0
     rejected_stops = 0
     rejected_cabin = 0
     rejected_price = 0
 
     for raw in flights:
+
         price = parse_price(raw)
+
         if price is None:
+
             rejected_price += 1
+
             continue
 
-        stops = int(raw.get("stops") or 0)
+        stops = int(
+            raw.get("stops") or 0
+        )
+
         if stops > MAX_STOPS:
+
             rejected_stops += 1
+
             continue
 
-        cabin = str(raw.get("cabin_class") or CABIN)
-        if cabin.lower() not in {"economy", "econ"}:
+        cabin = str(
+            raw.get("cabin_class")
+            or CABIN
+        )
+
+        if cabin.lower() not in {
+            "economy",
+            "econ",
+        }:
+
             rejected_cabin += 1
+
             continue
 
-        code = str(raw.get("airline_code") or "").upper()[:3]
+        code = str(
+            raw.get("airline_code")
+            or ""
+        ).upper()[:3]
 
         if not code:
-            number = str(raw.get("flight_number") or "").upper()
+
+            number = str(
+                raw.get("flight_number")
+                or ""
+            ).upper()
+
             for prefix in ALLOWED_AIRLINE_CODES:
+
                 if number.startswith(prefix):
+
                     code = prefix
+
                     break
 
         if code not in ALLOWED_AIRLINE_CODES:
+
             rejected_airline += 1
+
             continue
 
-        norm = normalize_offer(raw, origin, dest)
+        norm = normalize_offer(
+            raw,
+            origin,
+            dest,
+        )
+
         if norm:
             offers.append(norm)
 
-    print(f"  ACCEPTED: {len(offers)}")
-    print(f"  rejected - airline: {rejected_airline}")
-    print(f"  rejected - stops:   {rejected_stops}")
-    print(f"  rejected - cabin:   {rejected_cabin}")
-    print(f"  rejected - price:   {rejected_price}")
+    print(
+        f"  ACCEPTED: {len(offers)}"
+    )
 
-    offers.sort(key=lambda x: x["price_inr"])
+    print(
+        f"  rejected - airline: "
+        f"{rejected_airline}"
+    )
+
+    print(
+        f"  rejected - stops:   "
+        f"{rejected_stops}"
+    )
+
+    print(
+        f"  rejected - cabin:   "
+        f"{rejected_cabin}"
+    )
+
+    print(
+        f"  rejected - price:   "
+        f"{rejected_price}"
+    )
+
+    offers.sort(
+        key=lambda x: x["price_inr"]
+    )
+
     return offers
-
 
 
 # ---------------------------------------------------------------------------
@@ -1381,10 +1741,29 @@ def record_search(
         else None
     )
 
-    by_key = {
-        o["flight_key"]: o
-        for o in offers
-    }
+    # -----------------------------------------------------------------------
+    # VERY IMPORTANT:
+    #
+    # Capture existing flight keys BEFORE adding random first-entry watches.
+    #
+    # This allows us to correctly distinguish:
+    #
+    #     FIRST_ENTRY
+    #
+    # from:
+    #
+    #     MATCHED_ENTRY
+    #
+    # -----------------------------------------------------------------------
+
+    existing_watched_keys = set(
+        watched_keys_for(
+            conn,
+            origin,
+            dest,
+            dep_date,
+        )
+    )
 
     upsert_route_watch(
         conn,
@@ -1394,13 +1773,11 @@ def record_search(
         ts,
     )
 
-    # ---------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Select random flight watches for a NEW route/date.
     #
-    # IMPORTANT:
-    # This does not cause additional API calls.
-    # We already have all offers from this search.
-    # ---------------------------------------------------------------
+    # One API search gives us all offers, so no extra API call is made.
+    # -----------------------------------------------------------------------
 
     if also_watch_random and offers:
 
@@ -1413,31 +1790,41 @@ def record_search(
         )
 
         for offer in picks:
+
             upsert_flight_watch(
                 conn,
                 offer,
                 ts,
             )
 
-    # ---------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Record every previously watched flight.
-    # ---------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
-    for key in watched_keys_for(
+    current_watched_keys = watched_keys_for(
         conn,
         origin,
         dest,
         dep_date,
-    ):
+    )
+
+    by_key = {
+        o["flight_key"]: o
+        for o in offers
+    }
+
+    for key in current_watched_keys:
 
         offer = by_key.get(key)
 
         found = offer is not None
 
         if offer:
+
             row = offer
 
         else:
+
             row = {
                 "flight_key": key,
                 "origin": origin,
@@ -1467,9 +1854,32 @@ def record_search(
                 "extra_json": "",
             }
 
+        # -------------------------------------------------------------------
+        # FIRST_ENTRY vs MATCHED_ENTRY
+        #
+        # If this exact flight_key existed before this search:
+        #
+        #     MATCHED_ENTRY
+        #
+        # Otherwise:
+        #
+        #     FIRST_ENTRY
+        #
+        # This also works if a watched flight is missing from a later API
+        # response: it remains MATCHED_ENTRY because the identity was already
+        # known, but found=0.
+        # -------------------------------------------------------------------
+
+        entry_type = (
+            "MATCHED_ENTRY"
+            if key in existing_watched_keys
+            else "FIRST_ENTRY"
+        )
+
         ratio = None
 
         if found and cheapest:
+
             ratio = round(
                 row["price_inr"]
                 / cheapest,
@@ -1504,6 +1914,7 @@ def record_search(
             baseline_supplier is None
             and row.get("supplier_tag")
         ):
+
             conn.execute(
                 """
                 UPDATE flight_watches
@@ -1523,6 +1934,7 @@ def record_search(
                 flight_key,
                 sampled_at,
                 slot,
+                entry_type,
                 origin,
                 dest,
                 dep_date,
@@ -1560,13 +1972,14 @@ def record_search(
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?
             )
             """,
             (
                 key,
                 ts,
                 slot,
+                entry_type,
                 origin,
                 dest,
                 dep_date,
@@ -1602,9 +2015,9 @@ def record_search(
             ),
         )
 
-    # ---------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Store route-level best 2.
-    # ---------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     for rank, offer in enumerate(
         offers[:2],
@@ -1683,52 +2096,44 @@ def pick_new_route_dates(
     k: int,
     today: date,
 ) -> list[tuple[str, str, str]]:
+    """Pick k brand-new, distinct (origin, dest, dep_date) triples.
+
+    Builds the full candidate pool, removes every currently active
+    watch, then samples WITHOUT replacement. This guarantees:
+      - no duplicates inside the returned list,
+      - no overlap with existing active watches,
+      - no silent shortfall from a capped retry loop.
+    """
+
+    if k <= 0:
+        return []
 
     existing = set(
         active_route_dates(conn)
     )
 
-    routes = directed_routes()
-
-    out: list[
-        tuple[str, str, str]
-    ] = []
-
-    tries = 0
-
-    while len(out) < k and tries < 400:
-
-        tries += 1
-
-        origin, dest = random.choice(
-            routes
-        )
-
-        ahead = random.randint(
-            DAYS_AHEAD_MIN,
-            DAYS_AHEAD_MAX,
-        )
-
-        dep = (
+    dates = [
+        (
             today
             + timedelta(days=ahead)
         ).isoformat()
-
-        triple = (
-            origin,
-            dest,
-            dep,
+        for ahead in range(
+            DAYS_AHEAD_MIN,
+            DAYS_AHEAD_MAX + 1,
         )
+    ]
 
-        if (
-            triple in existing
-            or triple in out
-        ):
-            continue
+    pool = [
+        (origin, dest, dep)
+        for origin, dest in directed_routes()
+        for dep in dates
+        if (origin, dest, dep) not in existing
+    ]
 
-        out.append(triple)
-
-    return out
+    return random.sample(
+        pool,
+        k=min(k, len(pool)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1776,9 +2181,13 @@ def run_once(
         today.isoformat(),
     )
 
-    n_active = len(
+    enforce_watch_cap(conn)
+
+    active_at_start = set(
         active_route_dates(conn)
     )
+
+    n_active = len(active_at_start)
 
     # ---------------------------------------------------------------
     # First priority:
@@ -1825,6 +2234,10 @@ def run_once(
             )
         )
 
+    jobs = list(
+        dict.fromkeys(jobs)
+    )
+
     if not jobs:
 
         print(
@@ -1849,6 +2262,7 @@ def run_once(
     )
 
     if forced_slot:
+
         print(
             f"  MANUAL SLOT OVERRIDE: "
             f"{slot} "
@@ -1866,6 +2280,22 @@ def run_once(
         jobs,
         start=1,
     ):
+
+        if (
+            (origin, dest, dep_date)
+            not in active_at_start
+            and active_route_count(conn)
+            >= MAX_ROUTE_DATE_WATCHES
+        ):
+
+            print(
+                f"  [{i}/{len(jobs)}] "
+                f"{origin}->{dest} {dep_date} "
+                f"skipped (watch cap "
+                f"{MAX_ROUTE_DATE_WATCHES} reached)"
+            )
+
+            continue
 
         seed_flights = not watched_keys_for(
             conn,
@@ -1915,12 +2345,13 @@ def run_once(
             ok += 1
 
         except Exception as exc:
-            # Keep remaining jobs running.
+
             print(
                 f"FAILED: {exc}"
             )
 
         if i < len(jobs):
+
             time.sleep(
                 REQUEST_PAUSE_SEC
             )
@@ -1960,6 +2391,7 @@ def next_window_hour_wait() -> float:
     for _ in range(48):
 
         if t.hour in windows:
+
             return max(
                 0.0,
                 (
@@ -2033,7 +2465,9 @@ def export_preview(
     close = False
 
     if conn is None:
+
         conn = connect()
+
         close = True
 
     EXPORT_DIR.mkdir(
@@ -2108,6 +2542,7 @@ def export_preview(
                 writer.writerow(cols)
 
                 for row in rows:
+
                     writer.writerow(
                         [
                             row[c]
@@ -2180,9 +2615,12 @@ def _print_tables(
             dest,
             dep_date,
             flight_number,
+            dep_airport,
+            arr_airport,
             dep_time,
             arr_time,
             stops,
+            duration_minutes,
             airline_code,
             airline_type,
             price_inr,
@@ -2191,6 +2629,7 @@ def _print_tables(
             found,
             sampled_at,
             slot,
+            entry_type,
             searched_at,
             supplier_tag,
             supplier_changed
@@ -2215,8 +2654,11 @@ def _print_tables(
             f"  {r['origin']}->{r['dest']} "
             f"{r['dep_date']} "
             f"{r['flight_number']} "
+            f"{r['dep_airport']}->"
+            f"{r['arr_airport']} "
             f"{r['dep_time']}-{r['arr_time']} "
             f"stops={r['stops']} "
+            f"duration={r['duration_minutes']} "
             f"{r['airline_code']}/"
             f"{r['airline_type']} "
             f"{price} "
@@ -2224,6 +2666,7 @@ def _print_tables(
             f"dtd={r['days_to_departure']} "
             f"found={r['found']} "
             f"slot={r['slot']} "
+            f"entry={r['entry_type']} "
             f"supplier="
             f"{r['supplier_tag'] or 'unknown'}"
             f"{' [CHANGED]' if r['supplier_changed'] else ''}"
@@ -2310,6 +2753,22 @@ def print_status() -> None:
         """
     ).fetchone()[0]
 
+    n_first = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM flight_quotes
+        WHERE entry_type='FIRST_ENTRY'
+        """
+    ).fetchone()[0]
+
+    n_matched = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM flight_quotes
+        WHERE entry_type='MATCHED_ENTRY'
+        """
+    ).fetchone()[0]
+
     print(
         f"DB: {DB_PATH}"
     )
@@ -2328,6 +2787,14 @@ def print_status() -> None:
 
     print(
         f"route best-2 rows: {n_rq}"
+    )
+
+    print(
+        f"FIRST_ENTRY rows: {n_first}"
+    )
+
+    print(
+        f"MATCHED_ENTRY rows: {n_matched}"
     )
 
     _print_tables(conn)
@@ -2391,6 +2858,7 @@ def main() -> int:
     if args.slot is not None:
 
         try:
+
             forced_slot = validate_slot(
                 args.slot
             )
@@ -2415,6 +2883,7 @@ def main() -> int:
     elif args.command == "daemon":
 
         if forced_slot is not None:
+
             parser.error(
                 "--slot is only valid "
                 "with the 'once' command"
@@ -2427,6 +2896,7 @@ def main() -> int:
     elif args.command == "export":
 
         if forced_slot is not None:
+
             parser.error(
                 "--slot is only valid "
                 "with the 'once' command"
@@ -2437,6 +2907,7 @@ def main() -> int:
     else:
 
         if forced_slot is not None:
+
             parser.error(
                 "--slot is only valid "
                 "with the 'once' command"
