@@ -130,7 +130,7 @@ SAMPLE_HOURS_IST = (9, 21)
 # at the beginning of each sampling hour and processes its searches.
 SPREAD_HOURS = 1
 
-API_LIMIT_PER_HOUR = 60
+API_LIMIT_PER_HOUR = 80
 
 # Safety margin below FareEagle's stated 60/hour limit.
 API_SAFETY_MARGIN = 10
@@ -178,6 +178,59 @@ NEW_ROUTE_DATES_PER_HOUR = SEARCHES_PER_HOUR
 
 REQUEST_PAUSE_SEC = 2.0
 HTTP_TIMEOUT = 45
+
+# Failure handling.
+#
+# A failed search writes NO flight_quotes rows (it is not the same as
+# "flight not found"). Every attempt is logged in search_attempts instead.
+SEARCH_MAX_ATTEMPTS = 3          # per route/date search, within one run
+SEARCH_ATTEMPTS_BY_KIND = {      # kinds that deserve fewer attempts
+    "http_404": 2,
+}
+RETRYABLE_KINDS = {
+    "rate_limited",
+    "http_5xx",
+    "http_404",      # unknown meaning so far: retry, log body, never write found=0
+    "timeout",
+    "connection",
+    "api_failure",
+    "bad_json",
+}
+API_BUDGET_GUARD = 3             # stop calling when this close to the hourly limit
+RETRY_BACKOFF_SEC = 20           # attempt n waits n * this (or Retry-After, capped)
+RETRY_MAX_WAIT_SEC = 120
+
+# After a run with failures, the daemon re-runs only what is still due
+# for this slot (route/dates that have no row yet), up to this many passes.
+DAEMON_MAX_PASSES = 3
+DAEMON_PASS_WAIT_SEC = 600
+
+
+class SearchError(RuntimeError):
+    """A search that did not produce a usable result.
+
+    kind: rate_limited | http_5xx | http_<code> | timeout | connection |
+          api_failure | bad_json | budget_exhausted
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        code: int | None = None,
+        retry_after: int | None = None,
+        detail: str = "",
+    ) -> None:
+
+        self.kind = kind
+        self.code = code
+        self.retry_after = retry_after
+        self.detail = (detail or "")[:500]
+
+        super().__init__(
+            f"{kind}"
+            + (f" {code}" if code else "")
+            + (f": {self.detail[:200]}" if self.detail else "")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1111,23 @@ def connect() -> sqlite3.Connection:
 
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS search_attempts (
+            id INTEGER PRIMARY KEY,
+            origin TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            dep_date TEXT NOT NULL,
+            slot TEXT,
+            attempted_at TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            http_code INTEGER,
+            n_offers INTEGER,
+            detail TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_attempts_at
+            ON search_attempts(attempted_at);
+
         CREATE TABLE IF NOT EXISTS route_watches (
             id INTEGER PRIMARY KEY,
             origin TEXT NOT NULL,
@@ -1528,34 +1598,74 @@ def search_flights(
         "limit": 100,
     }
 
-    resp = requests.get(
-        API_URL,
-        params=params,
-        timeout=HTTP_TIMEOUT,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": (
-                "FlightPrediction/0.1 (research)"
-            ),
-        },
-    )
+    try:
+
+        resp = requests.get(
+            API_URL,
+            params=params,
+            timeout=HTTP_TIMEOUT,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": (
+                    "FlightPrediction/0.1 (research)"
+                ),
+            },
+        )
+
+    except requests.Timeout:
+
+        raise SearchError("timeout")
+
+    except requests.ConnectionError as exc:
+
+        raise SearchError(
+            "connection",
+            detail=str(exc),
+        )
 
     if resp.status_code == 429:
 
-        retry = int(
-            resp.headers.get(
-                "Retry-After"
-            )
-            or 60
+        raise SearchError(
+            "rate_limited",
+            429,
+            retry_after=int(
+                resp.headers.get(
+                    "Retry-After"
+                )
+                or 60
+            ),
+            detail=resp.text,
         )
 
-        raise RuntimeError(
-            f"rate limited; retry after {retry}s"
+    if resp.status_code >= 500:
+
+        raise SearchError(
+            "http_5xx",
+            resp.status_code,
+            detail=resp.text,
         )
 
-    resp.raise_for_status()
+    if resp.status_code >= 400:
 
-    payload = resp.json()
+        # The response body is kept: it is the only way to tell
+        # "no flights for this query" from a real endpoint problem.
+        raise SearchError(
+            f"http_{resp.status_code}",
+            resp.status_code,
+            detail=resp.text,
+        )
+
+    try:
+
+        payload = resp.json()
+
+    except ValueError:
+
+        raise SearchError(
+            "bad_json",
+            resp.status_code,
+            detail=resp.text,
+        )
 
     data = payload.get("data") or {}
 
@@ -1583,8 +1693,9 @@ def search_flights(
 
     if not payload.get("success"):
 
-        raise RuntimeError(
-            f"search failed: {payload}"
+        raise SearchError(
+            "api_failure",
+            detail=str(payload),
         )
 
     flights = (
@@ -2140,10 +2251,151 @@ def pick_new_route_dates(
 # Main one-shot collector
 # ---------------------------------------------------------------------------
 
+def log_attempt(
+    conn: sqlite3.Connection,
+    origin: str,
+    dest: str,
+    dep_date: str,
+    slot: str | None,
+    attempt: int,
+    status: str,
+    http_code: int | None,
+    n_offers: int | None,
+    detail: str,
+) -> None:
+    """Record one API attempt (success or failure)."""
+
+    conn.execute(
+        """
+        INSERT INTO search_attempts(
+            origin, dest, dep_date, slot, attempted_at,
+            attempt, status, http_code, n_offers, detail
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            origin,
+            dest,
+            dep_date,
+            slot,
+            now_ist().isoformat(timespec="seconds"),
+            attempt,
+            status,
+            http_code,
+            n_offers,
+            (detail or "")[:500],
+        ),
+    )
+
+    conn.commit()
+
+
+def calls_last_hour(
+    conn: sqlite3.Connection,
+) -> int:
+    """API calls made in the last 60 minutes, any run, success or not."""
+
+    cutoff = (
+        now_ist() - timedelta(hours=1)
+    ).isoformat(timespec="seconds")
+
+    return conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM search_attempts
+        WHERE attempted_at >= ?
+          AND status != 'budget_exhausted'
+        """,
+        (cutoff,),
+    ).fetchone()[0]
+
+
+def search_with_retry(
+    conn: sqlite3.Connection,
+    origin: str,
+    dest: str,
+    dep_date: str,
+    slot: str,
+) -> list[dict[str, Any]]:
+    """search_flights with typed errors, backoff and an hourly budget guard.
+
+    Raises SearchError if the search still fails. Nothing is written to
+    flight_quotes by this function.
+    """
+
+    attempt = 0
+
+    while True:
+
+        attempt += 1
+
+        if (
+            calls_last_hour(conn)
+            >= API_LIMIT_PER_HOUR - API_BUDGET_GUARD
+        ):
+
+            log_attempt(
+                conn, origin, dest, dep_date, slot,
+                attempt, "budget_exhausted", None, None,
+                f"{API_LIMIT_PER_HOUR}/hour budget nearly used",
+            )
+
+            raise SearchError("budget_exhausted")
+
+        try:
+
+            offers = search_flights(
+                origin,
+                dest,
+                dep_date,
+            )
+
+            log_attempt(
+                conn, origin, dest, dep_date, slot,
+                attempt, "ok", 200, len(offers), "",
+            )
+
+            return offers
+
+        except SearchError as exc:
+
+            log_attempt(
+                conn, origin, dest, dep_date, slot,
+                attempt, exc.kind, exc.code, None, exc.detail,
+            )
+
+            max_attempts = SEARCH_ATTEMPTS_BY_KIND.get(
+                exc.kind,
+                SEARCH_MAX_ATTEMPTS,
+            )
+
+            if (
+                exc.kind not in RETRYABLE_KINDS
+                or attempt >= max_attempts
+            ):
+                raise
+
+            wait = min(
+                exc.retry_after
+                or RETRY_BACKOFF_SEC * attempt,
+                RETRY_MAX_WAIT_SEC,
+            )
+
+            print(
+                f"{exc.kind}, retry {attempt}/"
+                f"{max_attempts - 1} in {wait}s ...",
+                end=" ",
+                flush=True,
+            )
+
+            time.sleep(wait)
+
+
 def run_once(
     max_searches: int,
     forced_slot: str | None = None,
-) -> None:
+) -> int:
+    """Run one sampling pass. Returns the number of failed searches."""
 
     sampled_at = now_ist()
 
@@ -2250,7 +2502,7 @@ def run_once(
 
         conn.close()
 
-        return
+        return 0
 
     print(
         f"{sampled_at.isoformat(timespec='seconds')} "
@@ -2271,6 +2523,8 @@ def run_once(
         )
 
     ok = 0
+
+    failed: list[tuple[str, str, str, str]] = []
 
     for i, (
         origin,
@@ -2314,10 +2568,12 @@ def run_once(
 
         try:
 
-            offers = search_flights(
+            offers = search_with_retry(
+                conn,
                 origin,
                 dest,
                 dep_date,
+                slot,
             )
 
             record_search(
@@ -2346,9 +2602,38 @@ def run_once(
 
         except Exception as exc:
 
+            reason = (
+                exc.kind
+                if isinstance(exc, SearchError)
+                else type(exc).__name__
+            )
+
             print(
                 f"FAILED: {exc}"
             )
+
+            failed.append(
+                (origin, dest, dep_date, reason)
+            )
+
+            if (
+                isinstance(exc, SearchError)
+                and exc.kind == "budget_exhausted"
+            ):
+
+                # Nothing more can be searched this hour.
+                for o, d, dt in jobs[i:]:
+
+                    failed.append(
+                        (o, d, dt, "budget_exhausted")
+                    )
+
+                print(
+                    f"  hourly API budget used up; "
+                    f"{len(jobs) - i} searches not attempted"
+                )
+
+                break
 
         if i < len(jobs):
 
@@ -2361,12 +2646,24 @@ def run_once(
         f"searches saved to {DB_PATH}"
     )
 
+    if failed:
+
+        print(
+            f"Failed ({len(failed)}): "
+            + ", ".join(
+                f"{o}->{d} {dt} ({why})"
+                for o, d, dt, why in failed
+            )
+        )
+
     export_preview(
         conn,
         sampled_at,
     )
 
     conn.close()
+
+    return len(failed)
 
 
 # ---------------------------------------------------------------------------
@@ -2430,10 +2727,37 @@ def run_daemon(
             in sample_window_hours()
         ):
 
-            run_once(
-                max_searches,
-                forced_slot=None,
-            )
+            for pass_no in range(
+                1,
+                DAEMON_MAX_PASSES + 1,
+            ):
+
+                failed = run_once(
+                    max_searches,
+                    forced_slot=None,
+                )
+
+                if (
+                    not failed
+                    or pass_no == DAEMON_MAX_PASSES
+                ):
+                    break
+
+                # Only route/dates still without a row for this slot
+                # are searched again on the next pass.
+                print(
+                    f"{failed} searches failed; "
+                    f"pass {pass_no + 1}/{DAEMON_MAX_PASSES} "
+                    f"in {DAEMON_PASS_WAIT_SEC}s"
+                )
+
+                time.sleep(DAEMON_PASS_WAIT_SEC)
+
+                if (
+                    now_ist().hour
+                    not in sample_window_hours()
+                ):
+                    break
 
         wait = next_window_hour_wait()
 
@@ -2873,9 +3197,11 @@ def main() -> int:
     # Execute command.
     # ---------------------------------------------------------------
 
+    failed_searches = 0
+
     if args.command == "once":
 
-        run_once(
+        failed_searches = run_once(
             args.max_searches,
             forced_slot=forced_slot,
         )
@@ -2915,7 +3241,9 @@ def main() -> int:
 
         print_status()
 
-    return 0
+    # Non-zero exit when searches were still failing after retries,
+    # so cron / systemd / a wrapper script can notice.
+    return 1 if failed_searches else 0
 
 
 if __name__ == "__main__":
